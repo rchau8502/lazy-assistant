@@ -1,6 +1,7 @@
 # 小助 · 懒人包
 
 [![CI](https://github.com/rchau8502/lazy-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/rchau8502/lazy-assistant/actions/workflows/ci.yml)
+
 一个下载就能用的个人 AI 助理：聊天、记事、写东西、做决定、到点提醒。
 自带流式回复、停止/重新生成、多会话、跨会话长期记忆、定时提醒、联网搜索，手机打开像 App。
 
