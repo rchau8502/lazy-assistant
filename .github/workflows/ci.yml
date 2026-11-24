@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start mock model upstream
+        run: |
+          uvicorn --app-dir tests mock_upstream:app --port 8011 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8011/docs >/dev/null && exit 0
+            sleep 1
+          done
+          echo "mock upstream did not start" && exit 1
+
+      - name: Start app
+        env:
+          LLM_BASE_URL: http://127.0.0.1:8011
+          LLM_API_KEY: mock-key
+          CONTEXT_TOKEN_LIMIT: "200"
+          TAVILY_BASE_URL: http://127.0.0.1:8011
+          TAVILY_API_KEY: mock-search
+          DB_PATH: data/ci.db
+        run: |
+          uvicorn app:app --port 8012 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8012/api/health >/dev/null && exit 0
+            sleep 1
+          done
+          echo "app did not start" && exit 1
+
+      - name: Run smoke test
+        env:
+          BASE_URL: http://127.0.0.1:8012
+        run: python tests/smoke_test.py
