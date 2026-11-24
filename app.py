@@ -8,6 +8,7 @@
 05 停止/重新生成   前端中断请求，后端停止生成并保存半截回复
 06 会话存储       SQLite 存会话、消息、备忘，前端只传 session_id + 这一句
 07 长期记忆       facts 表存「关于我」的事实，每次对话注入 system prompt，抽屉里可增删
+08 工具调用       提醒（create/list/complete）与联网搜索（Tavily），模型自己决定调用
 
 想改成你的助手：改 prompts/ 和 .env 就够了，代码不用动。
 """
@@ -23,6 +24,7 @@ import re
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -69,6 +71,12 @@ DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "chatbot.db")))
 CONTEXT_TOKEN_LIMIT = int(os.getenv("CONTEXT_TOKEN_LIMIT", "2000"))
 KEEP_RECENT_MESSAGES = max(2, int(os.getenv("KEEP_RECENT_MESSAGES", "4")))
 MAX_FACTS = max(10, int(os.getenv("MAX_FACTS", "60")))
+
+# 工具调用：提醒 + 联网搜索（Tavily）
+ENABLE_TOOLS = os.getenv("ENABLE_TOOLS", "1").strip() != "0"
+TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip()
+TAVILY_BASE_URL = (os.getenv("TAVILY_BASE_URL") or "https://api.tavily.com").rstrip("/")
+TAVILY_MAX_RESULTS = max(1, min(8, int(os.getenv("TAVILY_MAX_RESULTS", "4"))))
 
 # ---------------------------------------------------------------------------
 # 配置：品牌与文案（改 .env 即可换成你的机器人，不用碰 HTML）
@@ -161,6 +169,15 @@ CREATE TABLE IF NOT EXISTS facts (
     content    TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reminders (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    content    TEXT NOT NULL,
+    due_at     TEXT NOT NULL,
+    done       INTEGER NOT NULL DEFAULT 0,
+    fired      INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(done, fired);
 """
 
 
@@ -323,6 +340,109 @@ def delete_fact(fact_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 08 提醒：到点由前端轮询弹出通知（页面开着才会响）
+# ---------------------------------------------------------------------------
+
+REMINDER_LIMIT = 200
+
+
+def _now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def parse_due_at(value: str) -> datetime:
+    """接受 ISO 时间（可带时区）或 YYYY-MM-DD HH:MM；没时区就按本机时区。"""
+    value = (value or "").strip()
+    if not value:
+        raise ValueError("提醒时间不能为空")
+    text = value.replace("/", "-").replace(" ", "T")
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("时间格式看不懂，请用 ISO 格式，例如 2026-11-25T09:00:00+08:00") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_now().tzinfo)
+    return dt
+
+
+def _reminder_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["done"] = bool(item["done"])
+    item["fired"] = bool(item["fired"])
+    try:
+        item["due_ts"] = parse_due_at(item["due_at"]).timestamp()
+    except ValueError:
+        item["due_ts"] = 0
+    return item
+
+
+def list_reminders(include_done: bool = False) -> list[dict[str, Any]]:
+    sql = "SELECT id, content, due_at, done, fired, created_at FROM reminders"
+    if not include_done:
+        sql += " WHERE done=0"
+    with db() as conn:
+        rows = conn.execute(sql).fetchall()
+    items = [_reminder_row(r) for r in rows]
+    items.sort(key=lambda x: (x["due_ts"], x["id"]))
+    return items
+
+
+def add_reminder(content: str, due_at: str) -> dict[str, Any]:
+    content = (content or "").strip()[:REMINDER_LIMIT]
+    if not content:
+        raise ValueError("提醒内容不能为空")
+    due = parse_due_at(due_at)
+    if due < _now() - timedelta(hours=1):
+        raise ValueError("这个时间已经过去了，请按当前时间重新算一个")
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO reminders(content, due_at, done, fired, created_at) VALUES(?,?,0,0,?)",
+            (content, due.isoformat(timespec="seconds"), time.time()),
+        )
+        row = conn.execute(
+            "SELECT id, content, due_at, done, fired, created_at FROM reminders WHERE id=?",
+            (cur.lastrowid,),
+        ).fetchone()
+    return _reminder_row(row)
+
+
+def set_reminder_flags(
+    reminder_id: int, *, done: bool | None = None, fired: bool | None = None
+) -> dict[str, Any] | None:
+    with db() as conn:
+        if conn.execute("SELECT id FROM reminders WHERE id=?", (reminder_id,)).fetchone() is None:
+            return None
+        if done is not None:
+            conn.execute("UPDATE reminders SET done=? WHERE id=?", (1 if done else 0, reminder_id))
+        if fired is not None:
+            conn.execute("UPDATE reminders SET fired=? WHERE id=?", (1 if fired else 0, reminder_id))
+        row = conn.execute(
+            "SELECT id, content, due_at, done, fired, created_at FROM reminders WHERE id=?",
+            (reminder_id,),
+        ).fetchone()
+    return _reminder_row(row)
+
+
+def delete_reminder(reminder_id: int) -> None:
+    with db() as conn:
+        conn.execute("DELETE FROM reminders WHERE id=?", (reminder_id,))
+
+
+def due_reminders() -> list[dict[str, Any]]:
+    now = _now()
+    items = []
+    for item in list_reminders():
+        if item["fired"]:
+            continue
+        try:
+            if parse_due_at(item["due_at"]) <= now:
+                items.append(item)
+        except ValueError:
+            continue
+    return items
+
+
+# ---------------------------------------------------------------------------
 # 03 上下文组装与压缩
 # ---------------------------------------------------------------------------
 
@@ -335,7 +455,18 @@ def estimate_tokens(text: str) -> int:
     return cjk + max(1, (len(text) - cjk) // 4)
 
 
-def build_chat_messages(session: dict[str, Any], history: list[dict[str, Any]]) -> list[dict[str, str]]:
+_WEEKDAYS = "一二三四五六日"
+
+
+def now_hint() -> str:
+    now = _now()
+    return (
+        f"{now.strftime('%Y-%m-%d %H:%M')}（周{_WEEKDAYS[now.weekday()]}，"
+        f"时区偏移 {now.strftime('%z')}）"
+    )
+
+
+def build_chat_messages(session: dict[str, Any], history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     system = SYSTEM_PROMPT
     facts = list_facts()
     if facts:
@@ -343,21 +474,143 @@ def build_chat_messages(session: dict[str, Any], history: list[dict[str, Any]]) 
             "\n\n## 关于用户的长期记忆（跨会话保存，可信；和用户本轮说法冲突时以本轮为准）\n"
             + "\n".join(f"- {f['content']}" for f in facts)
         )
+    system += (
+        "\n\n## 当前时间\n"
+        + now_hint()
+        + "\n用户说「今天/明天/下周三」时按这个时间换算；创建提醒必须给出带时区的 ISO 时间。"
+    )
     memo = (session.get("memo") or "").strip()
     if memo:
         system += "\n\n## 更早对话的备忘（由系统压缩，内容可信）\n" + memo
-    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     for m in history:
         if m["role"] in ("user", "assistant") and m["content"].strip():
             messages.append({"role": m["role"], "content": m["content"]})
     return messages
 
 
-def history_tokens(messages: list[dict[str, str]]) -> int:
-    return sum(estimate_tokens(m["content"]) for m in messages)
+def history_tokens(messages: list[dict[str, Any]]) -> int:
+    return sum(estimate_tokens(m.get("content") or "") for m in messages)
 
 
-async def call_model_once(messages: list[dict[str, str]], max_tokens: int = 800) -> str:
+# ---------------------------------------------------------------------------
+# 09 工具：提醒 + 联网搜索
+# ---------------------------------------------------------------------------
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_reminder",
+            "description": "在用户本地时间创建一条定时提醒。用户说「提醒我」「到点叫我」「别忘了」时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "提醒内容，简短一句话"},
+                    "due_at": {
+                        "type": "string",
+                        "description": "提醒时间，ISO 8601 带时区，例如 2026-11-25T09:00:00+08:00；必须按「当前时间」换算",
+                    },
+                },
+                "required": ["content", "due_at"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_reminders",
+            "description": "列出用户还没完成的提醒。用户问「我有哪些提醒」时使用。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_reminder",
+            "description": "把某条提醒标记为完成。用户说「那条做完了」时使用，需要先拿到 id。",
+            "parameters": {
+                "type": "object",
+                "properties": {"id": {"type": "integer", "description": "提醒 id"}},
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "联网搜索实时信息。需要最新新闻、价格、天气、版本号时使用；没配搜索 key 会返回错误，不要编造结果。",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "搜索关键词"}},
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+
+async def web_search(query: str) -> dict[str, Any]:
+    if not TAVILY_API_KEY:
+        return {"error": "没有配置 TAVILY_API_KEY，暂时不能联网搜索；请告诉用户去 .env 里填"} 
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "basic",
+        "max_results": TAVILY_MAX_RESULTS,
+        "include_answer": True,
+    }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=10)) as client:
+        resp = await client.post(f"{TAVILY_BASE_URL}/search", json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"搜索服务返回 {resp.status_code}: {resp.text[:200]}"}
+        data = resp.json()
+    results = [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "content": (r.get("content") or "")[:500],
+        }
+        for r in (data.get("results") or [])[:TAVILY_MAX_RESULTS]
+    ]
+    return {"answer": data.get("answer") or "", "results": results}
+
+
+def _tool_result(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False)
+
+
+async def run_tool(name: str, arguments: str) -> str:
+    try:
+        args = json.loads(arguments or "{}")
+        if not isinstance(args, dict):
+            raise ValueError("参数必须是对象")
+    except Exception as exc:
+        return _tool_result({"error": f"参数解析失败：{exc}"})
+    try:
+        if name == "create_reminder":
+            reminder = add_reminder(str(args.get("content", "")), str(args.get("due_at", "")))
+            return _tool_result({"ok": True, "reminder": reminder, "note": "已保存，到点后用户打开小助会收到通知"})
+        if name == "list_reminders":
+            items = list_reminders()
+            return _tool_result({"ok": True, "count": len(items), "reminders": items[:20]})
+        if name == "complete_reminder":
+            item = set_reminder_flags(int(args.get("id", 0)), done=True)
+            if item is None:
+                return _tool_result({"error": "没有这个 id 的提醒"})
+            return _tool_result({"ok": True, "reminder": item})
+        if name == "web_search":
+            return _tool_result(await web_search(str(args.get("query", ""))))
+        return _tool_result({"error": f"未知工具 {name}"})
+    except ValueError as exc:
+        return _tool_result({"error": str(exc)})
+    except Exception as exc:
+        logger.warning("工具 %s 执行失败: %s", name, exc)
+        return _tool_result({"error": f"工具执行失败：{exc}"})
+
+
+async def call_model_once(messages: list[dict[str, Any]], max_tokens: int = 800) -> str:
     if needs_api_key():
         raise RuntimeError("服务端没有配置 LLM_API_KEY")
     payload = {"model": LLM_MODEL, "messages": messages, "temperature": 0.2, "max_tokens": max_tokens, "stream": False}
@@ -417,11 +670,24 @@ def sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-async def stream_model(messages: list[dict[str, str]]) -> AsyncIterator[str]:
+async def stream_chat(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+) -> AsyncIterator[dict[str, Any]]:
+    """流式调用模型：边吐文字边收集 tool_calls，结束时补一个 tool_calls 事件。"""
     if needs_api_key():
         raise RuntimeError("服务端没有配置 LLM_API_KEY，请先在 .env 里填好再试。")
-    payload = {"model": LLM_MODEL, "messages": messages, "temperature": 0.5, "max_tokens": LLM_MAX_TOKENS, "stream": True}
+    payload: dict[str, Any] = {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "temperature": 0.5,
+        "max_tokens": LLM_MAX_TOKENS,
+        "stream": True,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     headers = auth_headers()
+    calls: dict[int, dict[str, str]] = {}
     async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=15)) as client:
         async with client.stream("POST", f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload) as resp:
             if resp.status_code >= 400:
@@ -440,9 +706,24 @@ async def stream_model(messages: list[dict[str, str]]) -> AsyncIterator[str]:
                 choices = obj.get("choices") or []
                 if not choices:
                     continue
-                delta = (choices[0].get("delta") or {}).get("content")
-                if delta:
-                    yield delta
+                delta = choices[0].get("delta") or {}
+                if delta.get("content"):
+                    yield {"type": "delta", "text": delta["content"]}
+                for tc in delta.get("tool_calls") or []:
+                    try:
+                        index = int(tc.get("index", 0))
+                    except (TypeError, ValueError):
+                        index = 0
+                    slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["arguments"] += fn["arguments"]
+    if calls:
+        yield {"type": "tool_calls", "calls": [calls[i] for i in sorted(calls)]}
 
 
 async def reply_stream(request: Request, session_id: str) -> AsyncIterator[str]:
@@ -469,13 +750,51 @@ async def reply_stream(request: Request, session_id: str) -> AsyncIterator[str]:
 
     parts: list[str] = []
     stopped = False
+    tools = TOOLS if ENABLE_TOOLS else None
     try:
-        async for delta in stream_model(messages):
-            if await request.is_disconnected():
-                stopped = True
+        for round_index in range(4):
+            round_parts: list[str] = []
+            calls: list[dict[str, str]] = []
+            async for event in stream_chat(messages, tools):
+                if event["type"] == "delta":
+                    if await request.is_disconnected():
+                        stopped = True
+                        break
+                    round_parts.append(event["text"])
+                    parts.append(event["text"])
+                    yield sse({"type": "delta", "text": event["text"]})
+                elif event["type"] == "tool_calls":
+                    calls = event["calls"]
+            if stopped or not calls:
                 break
-            parts.append(delta)
-            yield sse({"type": "delta", "text": delta})
+
+            round_text = "".join(round_parts)
+            tool_calls_payload = []
+            for i, call in enumerate(calls):
+                call_id = call.get("id") or f"call_{round_index}_{i}"
+                call["id"] = call_id
+                tool_calls_payload.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": call.get("name", ""), "arguments": call.get("arguments") or "{}"},
+                    }
+                )
+            messages.append(
+                {"role": "assistant", "content": round_text or None, "tool_calls": tool_calls_payload}
+            )
+            for call in calls:
+                yield sse({"type": "tool", "name": call.get("name", ""), "status": "start"})
+                result_text = await run_tool(call.get("name", ""), call.get("arguments") or "{}")
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": result_text})
+                yield sse(
+                    {
+                        "type": "tool",
+                        "name": call.get("name", ""),
+                        "status": "done",
+                        "result": result_text[:300],
+                    }
+                )
     except asyncio.CancelledError:
         if parts:
             add_message(session_id, "assistant", "".join(parts), stopped=True)
@@ -576,6 +895,9 @@ async def health() -> dict[str, Any]:
         "system_prompt": str(SYSTEM_PROMPT_PATH.relative_to(BASE_DIR)),
         "handbook": HANDBOOK_PATH.exists(),
         "facts": len(list_facts()),
+        "reminders": len(list_reminders()),
+        "tools": ENABLE_TOOLS,
+        "search_configured": bool(TAVILY_API_KEY),
     }
 
 
@@ -599,6 +921,54 @@ async def new_fact(body: FactIn) -> Any:
 @app.delete("/api/facts/{fact_id}")
 async def remove_fact(fact_id: int) -> dict[str, Any]:
     delete_fact(fact_id)
+    return {"ok": True}
+
+
+# ------------------------------- 提醒 -------------------------------
+
+
+class ReminderIn(BaseModel):
+    content: str
+    due_at: str
+
+
+@app.get("/api/reminders")
+async def reminders(include_done: bool = False) -> list[dict[str, Any]]:
+    return list_reminders(include_done=include_done)
+
+
+@app.get("/api/reminders/due")
+async def reminders_due() -> list[dict[str, Any]]:
+    return due_reminders()
+
+
+@app.post("/api/reminders")
+async def new_reminder(body: ReminderIn) -> Any:
+    try:
+        return add_reminder(body.content, body.due_at)
+    except ValueError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=400)
+
+
+@app.post("/api/reminders/{reminder_id}/done")
+async def reminder_done(reminder_id: int) -> Any:
+    item = set_reminder_flags(reminder_id, done=True)
+    if item is None:
+        return JSONResponse({"detail": "提醒不存在"}, status_code=404)
+    return item
+
+
+@app.post("/api/reminders/{reminder_id}/fired")
+async def reminder_fired(reminder_id: int) -> Any:
+    item = set_reminder_flags(reminder_id, fired=True)
+    if item is None:
+        return JSONResponse({"detail": "提醒不存在"}, status_code=404)
+    return item
+
+
+@app.delete("/api/reminders/{reminder_id}")
+async def remove_reminder(reminder_id: int) -> dict[str, Any]:
+    delete_reminder(reminder_id)
     return {"ok": True}
 
 

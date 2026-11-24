@@ -1,4 +1,4 @@
-"""端到端自测：流式、停止、压缩、重新生成、会话删除。
+"""端到端自测：流式、停止、压缩、重新生成、长期记忆、提醒、搜索、会话删除。
 
 默认打 mock 上游所在的端口，可用 BASE_URL 覆盖：
     BASE_URL=http://127.0.0.1:8000 python tests/smoke_test.py
@@ -6,6 +6,7 @@
 import json
 import os
 import time
+from datetime import datetime, timedelta
 
 import httpx
 
@@ -90,11 +91,46 @@ def main():
         assert not any(x["id"] == f["id"] for x in c.get(f"{BASE}/api/facts").json())
         print("5) 长期记忆 OK")
 
-        # 6) 删除会话
+        # 6) 工具：对话里设提醒（mock 上游会发 create_reminder 工具调用）
+        sid2 = c.post(f"{BASE}/api/sessions").json()["id"]
+        events = post_chat(sid2, "明天 9 点提醒我交周报")
+        names = [(e.get("name"), e.get("status")) for e in events if e["type"] == "tool"]
+        text = "".join(e["text"] for e in events if e["type"] == "delta")
+        print("6) 工具事件:", names, "| 回复:", text[:30])
+        assert ("create_reminder", "done") in names, names
+        rems = c.get(f"{BASE}/api/reminders").json()
+        assert any("周报" in r["content"] for r in rems), rems
+        rid = next(r["id"] for r in rems if "周报" in r["content"])
+
+        # 7) 提醒接口：过去太久的拒绝、到点能查、fired 后不再出现
+        bad = c.post(f"{BASE}/api/reminders", json={"content": "过期", "due_at": "2020-01-01T09:00:00+08:00"})
+        assert bad.status_code == 400, bad.text
+        soon = (datetime.now().astimezone() - timedelta(minutes=2)).isoformat(timespec="seconds")
+        r3 = c.post(f"{BASE}/api/reminders", json={"content": "到点测试", "due_at": soon}).json()
+        due = c.get(f"{BASE}/api/reminders/due").json()
+        assert any(x["id"] == r3["id"] for x in due), due
+        assert c.post(f"{BASE}/api/reminders/{r3['id']}/fired").status_code == 200
+        assert not any(x["id"] == r3["id"] for x in c.get(f"{BASE}/api/reminders/due").json())
+        print("7) 提醒接口 OK（新增、到期查询、fired、过去时间 400）")
+
+        # 8) 联网搜索：web_search 工具调用 + mock /search
+        events = post_chat(sid2, "搜一下今天的 AI 新闻")
+        names = [e.get("name") for e in events if e["type"] == "tool"]
+        text = "".join(e["text"] for e in events if e["type"] == "delta")
+        print("8) 搜索工具:", names, "| 回复:", text[:40])
+        assert "web_search" in names and "查到" in text, (names, text)
+
+        # 清理提醒与测试会话
+        for rid in (rid, r3["id"]):
+            assert c.delete(f"{BASE}/api/reminders/{rid}").status_code == 200
+        assert not c.get(f"{BASE}/api/reminders").json()
+
+        # 9) 删除会话
         assert c.delete(f"{BASE}/api/sessions/{sid}").status_code == 200
+        assert c.delete(f"{BASE}/api/sessions/{sid2}").status_code == 200
         sessions = c.get(f"{BASE}/api/sessions").json()
-        assert not any(s["id"] == sid for s in sessions)
-        print("6) 删除会话 OK")
+        assert not any(s["id"] in (sid, sid2) for s in sessions)
+        print("9) 删除会话 OK")
         print("\nALL PASS")
 
 
